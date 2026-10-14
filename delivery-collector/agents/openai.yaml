@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delivery-Collector"
+  short_description: "自动发现测评运行、选择交付并按题归档，填写结果 Excel，生成人工核查清单"
+  default_prompt: "使用 $delivery-collector，收集指定对象和批次的测评交付，归档并填写结果 Excel。"

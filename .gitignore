@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+收集核查记录/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.token
