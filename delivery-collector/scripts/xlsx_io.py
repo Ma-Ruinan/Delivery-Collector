@@ -1,8 +1,9 @@
 """Small OOXML helpers: inspect, surgical text-cell updates, audit workbook.
 
 Existing result workbooks are never round-tripped through an object model.
-Only named cell elements in named sheet parts change; other ZIP payloads and
-all unrelated worksheet bytes stay intact. No formula recalculation is done.
+Text updates touch named cells only. Explicit slot extensions append blank
+style-only columns and their header structure; existing cell payloads and other
+ZIP parts are retained. No formula recalculation is done.
 """
 from __future__ import annotations
 
@@ -152,7 +153,101 @@ def patch_sheet(xml_bytes, updates):
     return text.encode("utf-8")
 
 
-def update_workbook(path, changes, backup):
+def extend_sheet(xml_bytes, source_columns, target_columns):
+    """Append an empty paired object slot, copying styles/widths, not results."""
+    text = xml_bytes.decode("utf-8")
+    root = ET.fromstring(text)
+    source = [col_number(c) for c in source_columns]
+    target = [col_number(c) for c in target_columns]
+    occupied = [col_number(CELL.fullmatch(c.get("r"))[1]) for c in root.iter(Q + "c")]
+    occupied += [col_number(CELL.fullmatch(m.get("ref").split(":")[-1])[1]) for m in root.iter(Q + "mergeCell")]
+    if len(source) != 2 or source[1] != source[0] + 1 or len(target) != 2 or target[1] != target[0] + 1:
+        raise ValueError("对象列组必须是相邻两列")
+    if target[0] <= max(occupied, default=0) or target[-1] > 16384:
+        raise ValueError("只能在现有列组右侧空白处扩展，不能覆盖已有数据或超出Excel列数")
+    if root.find(Q + "tableParts") is not None:
+        raise ValueError("原生Excel Table布局须使用可保留该功能的工具扩展，不直接改列")
+    if root.find(Q + "sheetProtection") is not None:
+        raise ValueError("不能扩展受保护工作表")
+    prefix = re.search(r"<((?:[\w]+:)?worksheet)\b", text)[1][:-len("worksheet")]
+    ctag, rtag = prefix + "c", prefix + "row"
+    def append_cells(match):
+        row = match[0]
+        row_number = re.search(r'\br="([0-9]+)"', row)[1]
+        cells = []
+        for s, t in zip(source_columns, target_columns):
+            old = re.search(r"<" + re.escape(ctag) + r'\b(?=[^>]*\br="' + s + row_number + r'")[^>]*?/?>', row)
+            if old:
+                style = re.search(r'\bs="([0-9]+)"', old[0])
+                cells.append('<' + ctag + ' r="' + t + row_number + '"' + (' s="' + style[1] + '"' if style else '') + '/>')
+            else:
+                cells.append('<' + ctag + ' r="' + t + row_number + '"/>')
+        insert = row.rfind('</' + rtag + '>')
+        ext = row.find('<' + prefix + 'extLst')
+        if ext >= 0:
+            insert = min(insert, ext)
+        row = row[:insert] + ''.join(cells) + row[insert:]
+        def spans(m):
+            return 'spans="' + m[1] + ':' + str(max(int(m[2]), target[-1])) + '"'
+        return re.sub(r'spans="([0-9]+):([0-9]+)"', spans, row, count=1)
+    text = re.sub(r"<" + re.escape(rtag) + r"\b[^>]*>.*?</" + re.escape(rtag) + ">", append_cells, text, flags=re.S)
+    # Column definitions may cover a range, so split only ranges intersecting
+    # the new pair rather than introducing overlapping <col> definitions.
+    columns = root.find(Q + "cols")
+    definitions = [dict(c.attrib) for c in columns] if columns is not None else []
+    original_cols = re.search(r"<" + prefix + r"cols\b(?:[^>]*?/>|[^>]*?>.*?</" + prefix + "cols>)", text, re.S)
+    col_elements = []
+    for attrs in definitions:
+        lo, hi = int(attrs["min"]), int(attrs["max"])
+        intervals = [(lo, hi)] if hi < target[0] or lo > target[-1] else [(lo, target[0] - 1), (target[-1] + 1, hi)]
+        for a, b in intervals:
+            if a <= b:
+                col_elements.append({**attrs, "min": str(a), "max": str(b)})
+    for s, t in zip(source, target):
+        attrs = next((d for d in definitions if int(d["min"]) <= s <= int(d["max"])), {})
+        col_elements.append({**attrs, "min": str(t), "max": str(t)})
+    col_elements.sort(key=lambda a: int(a["min"]))
+    cols_xml = '<' + prefix + 'cols>' + ''.join('<' + prefix + 'col ' + ' '.join(k + '=' + quoteattr(v) for k, v in attrs.items()) + '/>' for attrs in col_elements) + '</' + prefix + 'cols>'
+    if original_cols:
+        text = text[:original_cols.start()] + cols_xml + text[original_cols.end():]
+    else:
+        data_pos = text.index('<' + prefix + 'sheetData')
+        text = text[:data_pos] + cols_xml + text[data_pos:]
+    # Clone only merges wholly contained in the source pair. A broad page
+    # title crossing existing groups is unrelated and stays exactly as-is.
+    new_merges = []
+    offset = target[0] - source[0]
+    for merge in root.iter(Q + "mergeCell"):
+        a, _, b = merge.get("ref").partition(":")
+        left, right = CELL.fullmatch(a), CELL.fullmatch(b or a)
+        if source[0] <= col_number(left[1]) <= col_number(right[1]) <= source[-1]:
+            new_merges.append(col_name(col_number(left[1]) + offset) + left[2] + ':' + col_name(col_number(right[1]) + offset) + right[2])
+    if new_merges:
+        xml = ''.join('<' + prefix + 'mergeCell ref=' + quoteattr(ref) + '/>' for ref in new_merges)
+        merges = re.search('<' + prefix + r'mergeCells\b[^>]*>.*?</' + prefix + 'mergeCells>', text, re.S)
+        if merges:
+            updated = merges[0].replace('</' + prefix + 'mergeCells>', xml + '</' + prefix + 'mergeCells>')
+            count = len(list(root.iter(Q + "mergeCell"))) + len(new_merges)
+            updated = re.sub(r'\bcount="[0-9]+"', 'count="' + str(count) + '"', updated, count=1)
+            text = text[:merges.start()] + updated + text[merges.end():]
+        else:
+            # These elements follow mergeCells in the worksheet content order.
+            later = r'phoneticPr|conditionalFormatting|dataValidations|hyperlinks|printOptions|pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|customProperties|cellWatches|ignoredErrors|smartTags|drawing|legacyDrawing|legacyDrawingHF|picture|oleObjects|controls|webPublishItems|tableParts|extLst'
+            after_data = text.index('</' + prefix + 'sheetData>') + len('</' + prefix + 'sheetData>')
+            found = re.search('<' + prefix + '(?:' + later + r')\b', text[after_data:])
+            pos = after_data + found.start() if found else text.rfind('</' + prefix + 'worksheet>')
+            text = text[:pos] + '<' + prefix + 'mergeCells count="' + str(len(new_merges)) + '">' + xml + '</' + prefix + 'mergeCells>' + text[pos:]
+    def dimension(m):
+        ref = m[1]
+        a, sep, b = ref.partition(':')
+        end = CELL.fullmatch(b or a)
+        return m[0].replace(ref, a + ':' + col_name(max(target[-1], col_number(end[1]))) + end[2])
+    text = re.sub('<' + prefix + r'dimension\b[^>]*\bref="([A-Z]+[0-9]+(?::[A-Z]+[0-9]+)?)"[^>]*/>', dimension, text, count=1)
+    ET.fromstring(text)
+    return text.encode("utf-8")
+
+
+def update_workbook(path, changes, backup, extensions=None):
     """changes: [{sheet, cell, expected, value}]. Reject stale/formula edits."""
     path, backup = Path(path), Path(backup)
     before = digest(path)
@@ -177,11 +272,20 @@ def update_workbook(path, changes, backup):
             raise ValueError("不能覆盖公式单元格: " + cell)
         if (old or "") != clean_text(change["value"]):
             by_part.setdefault(sheet["part"], {})[cell] = change["value"]
+    for extension in extensions or []:
+        sheet = sheets[extension["sheet"]]
+        if sheet["protected"]:
+            raise ValueError("不能扩展受保护工作表")
+        by_part.setdefault(sheet["part"], {})
     if not by_part:
         return {"status": "unchanged", "sha256": before, "cells": []}
     # Validate every part before touching the workbook.
     with zipfile.ZipFile(path) as z:
-        payloads = {part: patch_sheet(z.read(part), values) for part, values in by_part.items()}
+        payloads = {part: z.read(part) for part in by_part}
+        for extension in extensions or []:
+            part = sheets[extension["sheet"]]["part"]
+            payloads[part] = extend_sheet(payloads[part], extension["source_columns"], extension["target_columns"])
+        payloads = {part: patch_sheet(payloads[part], values) for part, values in by_part.items()}
         backup.parent.mkdir(parents=True, exist_ok=True)
         if backup.exists():
             raise FileExistsError("备份已存在，不覆盖: " + str(backup))

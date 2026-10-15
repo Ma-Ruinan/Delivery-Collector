@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "delivery-collector" / "scripts"))
 import collector as c
 import xlsx_io as x
+from excel_layout import resolve_slot
 
 
 def main():
@@ -35,11 +36,14 @@ def main():
             path = output / original.name
             shutil.copy2(original, path)
             sheets = x.read_workbook(path)
-            sheet_name = next(iter(sheets)); cells = sheets[sheet_name]["cells"]
-            task_rows = [(addr, cell) for addr, cell in cells.items() if addr.startswith("B") and
-                         cell["value"] and cell["value"] not in ("任务编号",)]
+            initial_layout = resolve_slot({"object_slot": 2}, sheets,
+                                          {"name": "验收对象", "version": "v2", "model": "验收模型"})
+            sheet_name = initial_layout["sheet"]; cells = sheets[sheet_name]["cells"]
+            task_rows = [(addr, cell) for addr, cell in cells.items()
+                         if x.CELL.fullmatch(addr)[1] == initial_layout["task_id_column"] and
+                         cell["value"] and cell["value"] not in ("任务编号", "题号", "问题编号")]
             address = task_rows[0][0]; row = x.CELL.fullmatch(address)[2]
-            change_cell = "F" + row
+            change_cell = initial_layout["time_column"] + row
             with zipfile.ZipFile(path) as z:
                 before = {n: z.read(n) for n in z.namelist()}
             update = x.update_workbook(path, [{"sheet": sheet_name, "cell": change_cell,
@@ -54,8 +58,21 @@ def main():
                 if coord != change_cell:
                     assert after_cells[coord] == old, coord
             assert x.digest(original) == before_hash, "源记录表不得修改"
+            slot = resolve_slot({"object_slot": 3}, x.read_workbook(path),
+                                {"name": "验收对象", "version": "v2", "model": "验收模型"})
+            narrow_before = x.read_workbook(path)[sheet_name]["cells"]
+            headers = [{"sheet": slot["sheet"], **h} for h in slot["headers"]]
+            time_cell = slot["time_column"] + row
+            x.update_workbook(path, headers + [{"sheet": sheet_name, "cell": time_cell, "expected": None,
+                                                "value": "新增第三对象验收值，仅在副本"}],
+                              output / (original.stem + "-扩展前.xlsx"), slot["extensions"])
+            expanded = x.read_workbook(path)[sheet_name]["cells"]
+            for coord, old in narrow_before.items(): assert expanded[coord] == old, coord
+            assert expanded[time_cell]["value"] == "新增第三对象验收值，仅在副本"
+            assert x.digest(original) == before_hash
             item["workbooks"].append({"name": original.name, "edited_cell": change_cell,
-                                       "other_cells_and_parts_preserved": True, "status": update["status"]})
+                                       "other_cells_and_parts_preserved": True, "status": update["status"],
+                                       "third_object_added": True, "new_time_cell": time_cell})
         result.append(item)
     # A reusable failure transcript sample for visual/structural acceptance.
     failed = output / "验收样例-1.1-未成功任务界面输出.docx"

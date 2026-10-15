@@ -19,7 +19,9 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from xlsx_io import CELL, digest, merged_non_anchor, read_workbook, update_workbook, write_audit
+from xlsx_io import CELL, digest, extend_sheet, merged_non_anchor, read_workbook, update_workbook, write_audit
+from deadline import snapshot_task, timestamp
+from excel_layout import resolve_slot
 
 
 def emit(value):
@@ -202,6 +204,8 @@ def prepare_files(prefix, task, selected, read_roots):
     for file in artifacts:
         if file.get("session_id") != selected["session_id"] or not file.get("evidence"):
             raise ValueError("文件来源会话或正式交付证据缺失")
+        if selected.get("cutoff_at") and file.get("delivered_at") and timestamp(file["delivered_at"]) > timestamp(selected["cutoff_at"]):
+            raise ValueError("文件在截止后才正式交付，不纳入本次")
         source = absolute(file["source"])
         if not any(source.is_relative_to(root) for root in read_roots):
             raise ValueError("文件超出本对象读取范围")
@@ -232,6 +236,7 @@ def prepare_files(prefix, task, selected, read_roots):
             raise FileExistsError("同名不同内容，不覆盖: " + str(dest))
         operations.append({"source": str(source), "destination": str(dest), "sha256": sha,
                            "size": source.stat().st_size, "evidence": file["evidence"],
+                           "delivery_channel": file.get("delivery_channel", "source_evidence"),
                            "session_id": selected["session_id"], "copy_status": "planned"})
     return operations
 
@@ -248,12 +253,12 @@ def formal_blocks(selected):
         if block.get("kind") not in {"text", "image", "table"}:
             raise ValueError("无法保留的正式输出类型")
         blocks.append(block)
-    if not blocks:
+    if not blocks and not (selected.get("timed_out") and selected.get("cutoff_state_evidence") and selected.get("delivery_search_complete") is True):
         raise ValueError("未取得第二次正式输出，不能编造DOCX内容")
     return blocks
 
 
-def make_failure(path, blocks, read_roots):
+def make_failure(path, blocks, read_roots, observations=None):
     from docx import Document
     from docx.shared import Inches, Pt
     from docx.oxml import OxmlElement
@@ -294,6 +299,13 @@ def make_failure(path, blocks, read_roots):
                         node.set(qn("w:color"), "D9D9D9")
                         borders.append(node)
                     cell._tc.get_or_add_tcPr().append(borders)
+    if observations:
+        # This is the collector's evidence record, never an invented answer.
+        doc.add_paragraph("收集核查记录")
+        if not blocks:
+            doc.add_paragraph("截至本轮收集截止时点，已核实未见正式界面输出。")
+        for observation in observations:
+            doc.add_paragraph(observation)
     # Fixed metadata avoids treating a repeated identical export as a conflict.
     doc.core_properties.created = dt.datetime(2000, 1, 1)
     doc.core_properties.modified = dt.datetime(2000, 1, 1)
@@ -358,8 +370,14 @@ def save_json(path, value):
 
 
 def execute(plan, apply=False):
-    if plan.get("schema_version") != 1:
+    if plan.get("schema_version") not in (1, 2):
         raise ValueError("未知计划 schema_version")
+    deadline_mode = plan.get("deadline_mode", False)
+    cutoff_at = plan.get("cutoff_at")
+    if deadline_mode:
+        if not cutoff_at:
+            raise ValueError("定时收集须在开始发现前固定cutoff_at，不能在遍历结束后另取时间")
+        timestamp(cutoff_at)
     root = absolute(plan["dataset_root"])
     if not root.is_dir():
         raise ValueError("数据集不存在")
@@ -376,7 +394,9 @@ def execute(plan, apply=False):
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     report = inside(root / "收集核查记录" / f"{prefix}-{batch}-{stamp}", root)
     report.mkdir(parents=True, exist_ok=False)
-    audit = {"schema_version": 1, "object": object_info, "batch_id": batch,
+    audit = {"schema_version": 2, "object": object_info, "batch_id": batch,
+             "cutoff_at": cutoff_at, "deadline_mode": deadline_mode,
+             "unattended": plan.get("unattended", True),
              "applied": apply, "plan": plan, "tasks": [], "files": [], "issues": [],
              "excel": {"status": "not_updated"}, "human_verified": False}
     record = report / "收集发现与执行记录.json"
@@ -387,16 +407,26 @@ def execute(plan, apply=False):
             excel_path = inside(absolute(excel["path"]), root)
             if digest(excel_path) != excel["sha256"]:
                 raise ValueError("结果表自读取后发生变化")
+            sheets = read_workbook(excel_path)
+            if "object_slot" in excel:
+                excel = resolve_slot(excel, sheets, object_info)
+                # Preflight extension structure before copying any files.
+                with zipfile.ZipFile(excel_path) as z:
+                    preview_parts = {}
+                    for extension in excel.get("extensions", []):
+                        part = sheets[extension["sheet"]]["part"]
+                        preview_parts[part] = extend_sheet(preview_parts.get(part, z.read(part)), extension["source_columns"], extension["target_columns"])
+                audit["resolved_excel"] = excel
             if not excel.get("target_evidence"):
                 raise ValueError("未确认本对象 Excel 槽位")
             cols = [excel[k] for k in ("task_id_column", "time_column", "note_column")]
             if len(set(cols)) != 3 or any(not re.fullmatch("[A-Z]+", c) for c in cols):
                 raise ValueError("Excel题号/用时/说明列非法或重叠")
-            sheets = read_workbook(excel_path)
             if excel["sheet"] not in sheets:
                 raise ValueError("目标工作表不存在")
             for header in excel.get("headers", []):
-                if not CELL.fullmatch(header["cell"]) or CELL.fullmatch(header["cell"])[1] not in cols[1:]:
+                allowed = excel["allowed_header_columns"] if "object_slot" in excel else cols[1:]
+                if not CELL.fullmatch(header["cell"]) or CELL.fullmatch(header["cell"])[1] not in allowed:
                     raise ValueError("表头不属于指定对象列")
                 old = sheets[excel["sheet"]]["cells"].get(header["cell"], {}).get("value")
                 if (old or "") != (header["expected"] or ""):
@@ -408,7 +438,7 @@ def execute(plan, apply=False):
         audit["issues"].append({"task_id": "", "issue": "未定位结果表，文件收集继续；Excel未填写"})
     changes, seen = [], set()
     for original in plan["tasks"]:
-        task = dict(original)
+        task = snapshot_task(original, cutoff_at) if deadline_mode else dict(original)
         entry = {"task_id": task.get("task_id"), "attempts": task.get("attempts", []),
                  "requirements": task.get("requirements", []), "excel_status": "not_updated", "human_check": ""}
         audit["tasks"].append(entry)
@@ -436,13 +466,13 @@ def execute(plan, apply=False):
                 target = inside(base / name, base)
                 # Staged inside audit directory; never becomes an invented answer.
                 staged = report / name
-                make_failure(staged, blocks, roots)
+                make_failure(staged, blocks, roots, selected.get("collection_observations"))
                 sha = digest(staged)
                 if target.exists() and (not target.is_file() or digest(target) != sha):
                     raise FileExistsError("失败输出目标同名不同内容")
                 operations = [{"source": str(staged), "destination": str(target), "sha256": sha,
                     "size": staged.stat().st_size, "session_id": selected["session_id"],
-                    "evidence": [b["evidence"] for b in blocks], "copy_status": "planned",
+                    "evidence": [b["evidence"] for b in blocks] + ([selected["cutoff_state_evidence"]] if selected.get("timed_out") else []), "copy_status": "planned",
                     "generated_from_official_output": True}]
             else:
                 operations = prepare_files(prefix, task, selected, roots)
@@ -475,7 +505,7 @@ def execute(plan, apply=False):
             if digest(excel_path) != excel["sha256"]:
                 raise ValueError("收集期间结果表被修改，不覆盖")
             header_changes = [{"sheet": excel["sheet"], **h} for h in excel.get("headers", [])]
-            audit["excel"] = update_workbook(excel_path, changes + header_changes, report / (excel_path.stem + "-更新前.xlsx"))
+            audit["excel"] = update_workbook(excel_path, changes + header_changes, report / (excel_path.stem + "-更新前.xlsx"), excel.get("extensions"))
             for entry in audit["tasks"]:
                 if entry["excel_status"] == "planned":
                     entry["excel_status"] = "updated"
@@ -512,6 +542,11 @@ def main():
     p.add_argument("--equals", nargs=2, metavar=("COLUMN", "VALUE")); p.add_argument("--limit", type=int, default=100); p.add_argument("--offset", type=int, default=0)
     p = commands.add_parser("jsonl"); p.add_argument("file"); p.add_argument("--start", type=int, default=1); p.add_argument("--limit", type=int, default=50)
     p = commands.add_parser("workbook"); p.add_argument("file")
+    commands.add_parser("cutoff", help="在收集启动时固定UTC截止时间，预检/执行复用该值")
+    p = commands.add_parser("layout", help="按指定对象序号只读解析或规划Excel列组")
+    p.add_argument("file"); p.add_argument("--slot", type=int, required=True)
+    p.add_argument("--name", required=True); p.add_argument("--version", required=True)
+    p.add_argument("--model", required=True); p.add_argument("--sheet")
     p = commands.add_parser("execute"); p.add_argument("plan"); p.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     if hasattr(args, "limit") and not 1 <= args.limit <= 1000:
@@ -527,6 +562,13 @@ def main():
             result = jsonl_read(args)
         elif args.command == "workbook":
             result = read_workbook(args.file)
+        elif args.command == "cutoff":
+            result = {"cutoff_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+        elif args.command == "layout":
+            config = {"path": str(absolute(args.file)), "sha256": digest(args.file), "object_slot": args.slot}
+            if args.sheet:
+                config["sheet"] = args.sheet
+            result = resolve_slot(config, read_workbook(args.file), {"name": args.name, "version": args.version, "model": args.model})
         else:
             result = execute(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")), args.apply)
         emit(result)
