@@ -242,7 +242,9 @@ def prepare_files(prefix, task, selected, read_roots):
 
 
 def formal_blocks(selected):
-    if selected.get("official_output_complete") is not True:
+    cutoff_snapshot = (selected.get("timed_out") and selected.get("cutoff_state_evidence") and
+                       selected.get("delivery_search_complete") is True)
+    if selected.get("official_output_complete") is not True and not cutoff_snapshot:
         raise ValueError("第二次正式界面输出未完整取得")
     blocks = []
     for block in selected.get("official_output", []):
@@ -253,12 +255,12 @@ def formal_blocks(selected):
         if block.get("kind") not in {"text", "image", "table"}:
             raise ValueError("无法保留的正式输出类型")
         blocks.append(block)
-    if not blocks and not (selected.get("timed_out") and selected.get("cutoff_state_evidence") and selected.get("delivery_search_complete") is True):
+    if not blocks and not cutoff_snapshot:
         raise ValueError("未取得第二次正式输出，不能编造DOCX内容")
     return blocks
 
 
-def make_failure(path, blocks, read_roots, observations=None):
+def make_failure(path, blocks, read_roots, observations=None, snapshot_complete=True):
     from docx import Document
     from docx.shared import Inches, Pt
     from docx.oxml import OxmlElement
@@ -303,7 +305,8 @@ def make_failure(path, blocks, read_roots, observations=None):
         # This is the collector's evidence record, never an invented answer.
         doc.add_paragraph("收集核查记录")
         if not blocks:
-            doc.add_paragraph("截至本轮收集截止时点，已核实未见正式界面输出。")
+            doc.add_paragraph("截至本轮收集截止时点，已核实未见正式界面输出。" if snapshot_complete else
+                              "正式界面输出快照未完整取得，不能据此认定没有正式输出。")
         for observation in observations:
             doc.add_paragraph(observation)
     # Fixed metadata avoids treating a repeated identical export as a conflict.
@@ -372,8 +375,8 @@ def save_json(path, value):
 def execute(plan, apply=False):
     if plan.get("schema_version") not in (1, 2):
         raise ValueError("未知计划 schema_version")
-    deadline_mode = plan.get("deadline_mode", False)
     cutoff_at = plan.get("cutoff_at")
+    deadline_mode = plan.get("deadline_mode", bool(cutoff_at))
     if deadline_mode:
         if not cutoff_at:
             raise ValueError("定时收集须在开始发现前固定cutoff_at，不能在遍历结束后另取时间")
@@ -437,6 +440,20 @@ def execute(plan, apply=False):
     else:
         audit["issues"].append({"task_id": "", "issue": "未定位结果表，文件收集继续；Excel未填写"})
     changes, seen = [], set()
+
+    def schedule_excel(task, entry, decision, selected):
+        if sheets is None or excel_problem:
+            return
+        try:
+            cells = task_cells(excel, sheets, task, excel_values(decision, task, selected))
+            if {(c['sheet'], c['cell']) for c in cells} & {(c['sheet'], c['cell']) for c in changes}:
+                raise ValueError("多个题号映射到同一Excel记录行，需确认编号映射")
+            entry["planned_cells"] = cells
+            changes.extend(cells)
+            entry["excel_status"] = "planned"
+        except Exception as e:
+            audit["issues"].append({"task_id": task["task_id"], "issue": "Excel: " + str(e)})
+
     for original in plan["tasks"]:
         task = snapshot_task(original, cutoff_at) if deadline_mode else dict(original)
         entry = {"task_id": task.get("task_id"), "attempts": task.get("attempts", []),
@@ -461,12 +478,24 @@ def execute(plan, apply=False):
             if decision != "first_success" and any(r.get("status") == "failed" and not r.get("reason") for r in task["attempts"]):
                 raise ValueError("失败运行缺少实际原因")
             if decision == "both_failed":
+                # Record the confirmed execution outcome independently of DOCX
+                # extraction, rendering and copying; success keeps its old gate.
+                schedule_excel(task, entry, decision, selected)
                 blocks = formal_blocks(selected)
+                snapshot_complete = selected.get("output_snapshot_complete", selected.get("official_output_complete")) is True
+                observations = list(selected.get("collection_observations") or [])
+                if selected.get("timed_out") and not snapshot_complete:
+                    warning = "正式界面输出快照未完整取得；仅保存已核实的可见内容及收集事实，待人工核查"
+                    observations.append(warning)
+                    entry["output_snapshot_status"] = "partial"
+                    audit["issues"].append({"task_id": task_id, "issue": warning})
+                    if entry.get("planned_cells"):
+                        entry["planned_cells"][1]["value"] += "；界面输出快照未完整取得（见核查清单）"
                 name = f"{prefix}-{task_id}-未成功任务界面输出.docx"
                 target = inside(base / name, base)
                 # Staged inside audit directory; never becomes an invented answer.
                 staged = report / name
-                make_failure(staged, blocks, roots, selected.get("collection_observations"))
+                make_failure(staged, blocks, roots, observations, snapshot_complete)
                 sha = digest(staged)
                 if target.exists() and (not target.is_file() or digest(target) != sha):
                     raise FileExistsError("失败输出目标同名不同内容")
@@ -484,19 +513,13 @@ def execute(plan, apply=False):
                     copy_one(op)
                     save_json(record, audit)
             entry["collection_status"] = "collected" if apply else "planned"
-            if sheets is not None and not excel_problem:
-                try:
-                    cells = task_cells(excel, sheets, task, excel_values(decision, task, selected))
-                    if {(c['sheet'], c['cell']) for c in cells} & {(c['sheet'], c['cell']) for c in changes}:
-                        raise ValueError("多个题号映射到同一Excel记录行，需确认编号映射")
-                    entry["planned_cells"] = cells
-                    changes.extend(cells)
-                    entry["excel_status"] = "planned"
-                except Exception as e:
-                    audit["issues"].append({"task_id": task_id, "issue": "Excel: " + str(e)})
+            if decision != "both_failed":
+                schedule_excel(task, entry, decision, selected)
         except Exception as e:
             entry["collection_status"] = "pending"
             entry["issue"] = str(e)
+            if entry.get("decision") == "both_failed" and entry.get("planned_cells"):
+                entry["planned_cells"][1]["value"] += "；输出快照保存失败（见核查清单）"
             audit["issues"].append({"task_id": task.get("task_id", ""), "issue": str(e)})
         finally:
             save_json(record, audit)

@@ -90,7 +90,10 @@ class DeadlineTests(unittest.TestCase):
         result = at_deadline(value, CUTOFF)
         self.assertEqual(result["elapsed_seconds"], 7080)
         value.pop("pause_evidence")
-        self.assertEqual(at_deadline(value, CUTOFF)["status"], "unknown")
+        result = at_deadline(value, CUTOFF)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("暂停时间", result["duration_issue"])
+        self.assertNotIn("duration", result)
 
     def test_input_snapshot_not_mutated(self):
         value = running(); before = copy.deepcopy(value)
