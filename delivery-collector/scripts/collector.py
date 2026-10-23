@@ -22,6 +22,7 @@ from xml.etree import ElementTree as ET
 from xlsx_io import CELL, digest, extend_sheet, merged_non_anchor, read_workbook, update_workbook, write_audit
 from deadline import snapshot_task, timestamp
 from excel_layout import resolve_slot
+from evidence import eligible_task, normalize_duration, check_deliveries, read_deliveries
 
 
 def emit(value):
@@ -162,6 +163,15 @@ def timing(run):
 
 
 def excel_values(decision, task, selected):
+    value, note = base_excel_values(decision, task, selected)
+    used = task["attempts"][:1] if decision == "first_success" else task["attempts"]
+    for index, run in enumerate(used, 1):
+        if run.get("duration_note"):
+            note += f"；第{index}次用时：{run['duration_note']}"
+    return value, note
+
+
+def base_excel_values(decision, task, selected):
     runs = task["attempts"]
     first_time = timing(runs[0]) or "用时无法确认"
     first_reason = runs[0].get("reason", "")
@@ -373,8 +383,9 @@ def save_json(path, value):
 
 
 def execute(plan, apply=False):
-    if plan.get("schema_version") not in (1, 2):
+    if plan.get("schema_version") not in (1, 2, 3):
         raise ValueError("未知计划 schema_version")
+    strict_evidence = plan["schema_version"] >= 3
     cutoff_at = plan.get("cutoff_at")
     deadline_mode = plan.get("deadline_mode", bool(cutoff_at))
     if deadline_mode:
@@ -397,7 +408,7 @@ def execute(plan, apply=False):
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     report = inside(root / "收集核查记录" / f"{prefix}-{batch}-{stamp}", root)
     report.mkdir(parents=True, exist_ok=False)
-    audit = {"schema_version": 2, "object": object_info, "batch_id": batch,
+    audit = {"schema_version": max(2, plan["schema_version"]), "object": object_info, "batch_id": batch,
              "cutoff_at": cutoff_at, "deadline_mode": deadline_mode,
              "unattended": plan.get("unattended", True),
              "applied": apply, "plan": plan, "tasks": [], "files": [], "issues": [],
@@ -455,8 +466,12 @@ def execute(plan, apply=False):
             audit["issues"].append({"task_id": task["task_id"], "issue": "Excel: " + str(e)})
 
     for original in plan["tasks"]:
-        task = snapshot_task(original, cutoff_at) if deadline_mode else dict(original)
+        task = eligible_task(original, strict_evidence)
+        task = snapshot_task(task, cutoff_at) if deadline_mode else task
+        for run in task.get("attempts", []):
+            normalize_duration(run, strict_evidence)
         entry = {"task_id": task.get("task_id"), "attempts": task.get("attempts", []),
+                 "excluded_candidates": task.get("excluded_candidates", []),
                  "requirements": task.get("requirements", []), "excel_status": "not_updated", "human_check": ""}
         audit["tasks"].append(entry)
         try:
@@ -475,6 +490,10 @@ def execute(plan, apply=False):
                 continue
             if decision == "pending":
                 raise ValueError(reason)
+            used = task["attempts"][:1] if decision == "first_success" else task["attempts"]
+            for run in used:
+                if run.get("duration_issue"):
+                    audit["issues"].append({"task_id": task_id, "issue": f"会话{run['session_id']}用时无法确认：{run['duration_issue']}"})
             if decision != "first_success" and any(r.get("status") == "failed" and not r.get("reason") for r in task["attempts"]):
                 raise ValueError("失败运行缺少实际原因")
             if decision == "both_failed":
@@ -504,6 +523,7 @@ def execute(plan, apply=False):
                     "evidence": [b["evidence"] for b in blocks] + ([selected["cutoff_state_evidence"]] if selected.get("timed_out") else []), "copy_status": "planned",
                     "generated_from_official_output": True}]
             else:
+                check_deliveries(selected, strict_evidence)
                 operations = prepare_files(prefix, task, selected, roots)
             for op in operations:
                 op["task_id"] = task_id
@@ -528,7 +548,7 @@ def execute(plan, apply=False):
             if digest(excel_path) != excel["sha256"]:
                 raise ValueError("收集期间结果表被修改，不覆盖")
             header_changes = [{"sheet": excel["sheet"], **h} for h in excel.get("headers", [])]
-            audit["excel"] = update_workbook(excel_path, changes + header_changes, report / (excel_path.stem + "-更新前.xlsx"), excel.get("extensions"))
+            audit["excel"] = update_workbook(excel_path, changes + header_changes, report / (excel_path.stem + "-更新前.xlsx"), excel.get("extensions"), center=True)
             for entry in audit["tasks"]:
                 if entry["excel_status"] == "planned":
                     entry["excel_status"] = "updated"
@@ -540,7 +560,7 @@ def execute(plan, apply=False):
     for e in audit["tasks"]:
         task_rows.append([e["task_id"], e.get("decision", "pending"), e.get("selected_session"),
             e.get("selection_reason", e.get("issue", "")), json.dumps(e["requirements"], ensure_ascii=False),
-            json.dumps(e["attempts"], ensure_ascii=False), e.get("collection_status", "未执行"), e["excel_status"], ""])
+            json.dumps({"attempts": e["attempts"], "excluded_candidates": e["excluded_candidates"]}, ensure_ascii=False), e.get("collection_status", "未执行"), e["excel_status"], ""])
     file_rows = [["题号", "来源会话", "源文件", "目标文件", "字节数", "SHA256", "正式来源证据", "复制状态", "人工核查"]]
     for f in audit["files"]:
         file_rows.append([f["task_id"], f["session_id"], f["source"], f["destination"], f["size"], f["sha256"], str(f["evidence"]), f["copy_status"], ""])
@@ -565,6 +585,9 @@ def main():
     p.add_argument("--equals", nargs=2, metavar=("COLUMN", "VALUE")); p.add_argument("--limit", type=int, default=100); p.add_argument("--offset", type=int, default=0)
     p = commands.add_parser("jsonl"); p.add_argument("file"); p.add_argument("--start", type=int, default=1); p.add_argument("--limit", type=int, default=50)
     p = commands.add_parser("workbook"); p.add_argument("file")
+    p = commands.add_parser("deliveries", help="只读提取同会话全部成功交付组件，不按文件名过滤")
+    p.add_argument("product", choices=("workbuddy", "mobilework")); p.add_argument("file")
+    p.add_argument("--session", required=True); p.add_argument("--cutoff")
     commands.add_parser("cutoff", help="在收集启动时固定UTC截止时间，预检/执行复用该值")
     p = commands.add_parser("layout", help="按指定对象序号只读解析或规划Excel列组")
     p.add_argument("file"); p.add_argument("--slot", type=int, required=True)
@@ -585,6 +608,8 @@ def main():
             result = jsonl_read(args)
         elif args.command == "workbook":
             result = read_workbook(args.file)
+        elif args.command == "deliveries":
+            result = read_deliveries(args.product, absolute(args.file), args.session, args.cutoff)
         elif args.command == "cutoff":
             result = {"cutoff_at": dt.datetime.now(dt.timezone.utc).isoformat()}
         elif args.command == "layout":

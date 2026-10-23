@@ -4,10 +4,13 @@ Existing result workbooks are never round-tripped through an object model.
 Text updates touch named cells only. Explicit slot extensions append blank
 style-only columns and their header structure; existing cell payloads and other
 ZIP parts are retained. No formula recalculation is done.
+Optional centering appends style copies for written cells; existing style
+definitions and other objects' cell styles remain unchanged.
 """
 from __future__ import annotations
 
 import hashlib
+import copy
 import os
 import posixpath
 import re
@@ -109,7 +112,7 @@ def merged_non_anchor(address, ranges):
     return False
 
 
-def patch_sheet(xml_bytes, updates):
+def patch_sheet(xml_bytes, updates, styles=None):
     text = xml_bytes.decode("utf-8")
     # Keep the original namespace declarations and every unrelated byte.
     # Prefix-aware matching supports both default and prefixed SpreadsheetML.
@@ -130,6 +133,8 @@ def patch_sheet(xml_bytes, updates):
         if existing:
             opening = re.match(r"<[^\s>]+(.*?)(?:/?>)", existing[0], re.S)[1]
             attrs = re.sub(r'\s+t="[^"]*"', "", opening).rstrip("/ ")
+        if styles and address in styles:
+            attrs = re.sub(r'\s+s="[^"]*"', "", attrs) + ' s="' + str(styles[address]) + '"'
         element = ("<" + ctag + attrs + ' t="inlineStr"><' + prefix +
                    'is><' + prefix + 't xml:space="preserve">' + escape(value) +
                    "</" + prefix + "t></" + prefix + "is></" + ctag + ">")
@@ -151,6 +156,47 @@ def patch_sheet(xml_bytes, updates):
             text = text[:row_match.start()] + row_text + text[row_match.end():]
     ET.fromstring(text)  # structural check before saving
     return text.encode("utf-8")
+
+
+def centered_styles(xml_bytes, indices):
+    """Append centered xf copies; retain original style definitions verbatim."""
+    root = ET.fromstring(xml_bytes)
+    xfs = root.find(Q + "cellXfs")
+    if xfs is None:
+        raise ValueError("工作簿缺少单元格样式定义")
+    mapping, additions = {}, []
+    for index in sorted(indices):
+        if not 0 <= index < len(xfs):
+            raise ValueError("单元格样式索引越界")
+        xf = xfs[index]
+        alignment = xf.find(Q + "alignment")
+        if alignment is not None and alignment.get("horizontal") == "center" and alignment.get("vertical") == "center" and xf.get("applyAlignment") != "0":
+            mapping[index] = index
+            continue
+        xf = copy.deepcopy(xf)
+        alignment = xf.find(Q + "alignment")
+        if alignment is None:
+            alignment = ET.Element(Q + "alignment")
+            later = next((child for child in xf if child.tag in {Q + "protection", Q + "extLst"}), None)
+            xf.insert(list(xf).index(later) if later is not None else len(xf), alignment)
+        alignment.set("horizontal", "center")
+        alignment.set("vertical", "center")
+        xf.set("applyAlignment", "1")
+        mapping[index] = len(xfs) + len(additions)
+        additions.append(ET.tostring(xf, encoding="unicode"))
+    if not additions:
+        return xml_bytes, mapping
+    text = xml_bytes.decode("utf-8")
+    match = re.search(r'<((?:[\w]+:)?cellXfs)\b[^>]*>.*?</\1>', text, re.S)
+    if match is None:
+        raise ValueError("无法定位样式列表")
+    block = match[0]
+    opening_end = block.index(">")
+    opening = re.sub(r'\s+count="[^"]*"', "", block[:opening_end]) + f' count="{len(xfs) + len(additions)}">'
+    block = opening + block[opening_end + 1:block.rfind("</")] + "".join(additions) + "</" + match[1] + ">"
+    text = text[:match.start()] + block + text[match.end():]
+    ET.fromstring(text)
+    return text.encode("utf-8"), mapping
 
 
 def extend_sheet(xml_bytes, source_columns, target_columns):
@@ -247,7 +293,7 @@ def extend_sheet(xml_bytes, source_columns, target_columns):
     return text.encode("utf-8")
 
 
-def update_workbook(path, changes, backup, extensions=None):
+def update_workbook(path, changes, backup, extensions=None, center=False):
     """changes: [{sheet, cell, expected, value}]. Reject stale/formula edits."""
     path, backup = Path(path), Path(backup)
     before = digest(path)
@@ -270,7 +316,7 @@ def update_workbook(path, changes, backup, extensions=None):
             raise ValueError("Excel 已变化，需重新读取: " + cell)
         if sheet["cells"].get(cell, {}).get("formula") is not None:
             raise ValueError("不能覆盖公式单元格: " + cell)
-        if (old or "") != clean_text(change["value"]):
+        if center or (old or "") != clean_text(change["value"]):
             by_part.setdefault(sheet["part"], {})[cell] = change["value"]
     for extension in extensions or []:
         sheet = sheets[extension["sheet"]]
@@ -285,7 +331,19 @@ def update_workbook(path, changes, backup, extensions=None):
         for extension in extensions or []:
             part = sheets[extension["sheet"]]["part"]
             payloads[part] = extend_sheet(payloads[part], extension["source_columns"], extension["target_columns"])
-        payloads = {part: patch_sheet(payloads[part], values) for part, values in by_part.items()}
+        style_targets, style_payload = {}, None
+        if center:
+            for part, values in by_part.items():
+                cells = {c.get("r"): int(c.get("s", "0")) for c in ET.fromstring(payloads[part]).iter(Q + "c")}
+                style_targets[part] = {cell: cells.get(cell, 0) for cell in values}
+            style_payload, mapping = centered_styles(z.read("xl/styles.xml"),
+                                                     {index for targets in style_targets.values() for index in targets.values()})
+            style_targets = {part: {cell: mapping[index] for cell, index in targets.items()} for part, targets in style_targets.items()}
+        payloads = {part: patch_sheet(payloads[part], values, style_targets.get(part)) for part, values in by_part.items()}
+        if style_payload is not None:
+            payloads["xl/styles.xml"] = style_payload
+        if all(payload == z.read(part) for part, payload in payloads.items()):
+            return {"status": "unchanged", "sha256": before, "cells": []}
         backup.parent.mkdir(parents=True, exist_ok=True)
         if backup.exists():
             raise FileExistsError("备份已存在，不覆盖: " + str(backup))

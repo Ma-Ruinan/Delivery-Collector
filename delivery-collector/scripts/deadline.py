@@ -31,6 +31,10 @@ def at_deadline(original, cutoff_at):
     cutoff = timestamp(cutoff_at)
     run["cutoff_at"] = cutoff_at
     run["observed_status"] = run.get("status")
+    if run.get("client_presence_verified") is False:
+        run["status"] = "unknown"
+        run["reason"] = "客户端有效任务列表归属未核实"
+        return run
     try:
         submitted = timestamp(run["submitted_at"])
         if submitted > cutoff:

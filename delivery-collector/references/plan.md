@@ -1,12 +1,12 @@
 # 执行计划 JSON 约定
 
-计划是agent读取证据后形成的内部文件，不让使用者手工填写。脚本不猜题号、会话身份或内容质量。新计划用schema_version 2，原schema 1及显式列映射仍兼容。
+计划是agent读取证据后形成的内部文件，不让使用者手工填写。脚本不猜题号、会话身份或内容质量。**新生成计划用schema_version 3**：核查客户端有效性、交付覆盖与完整用时来源。旧schema 1/2及显式列映射仍可重读；不能为绕过新版检查而降级新计划。
 
 ## 发现与执行
 
 1. 定时任务在发现前运行 `python scripts/collector.py cutoff`，将返回值存为cutoff_at，设deadline_mode true；预检、执行、重试复用，不用后来的遍历结束时间。已有cutoff_at而漏设开关时脚本也启用截止判断；普通非截止收集显式设deadline_mode false。
-2. 按调用读取根会话、正式输出、组件/路径；匹配题号原目录，attempts按真实提交时间排序。继续/子代理不算重试，排除项写excluded_candidates及依据。状态/路径不明先自主查证，仍不明记pending，不中途提问。
-3. success必须核查全部必需文件，列artifacts、哈希、来源引用。`delivery_channel: formal_path`表示正式答复给出路径，无需下载组件。必须检查实际最终文件，不能因没按钮写failed。
+2. 按调用读取当前有效根会话、删除状态、正式输出、组件/路径；匹配题号原目录，attempts按真实提交时间排序。每次run填client_presence及presence_evidence。已删除会话先排除，不参与次数和成功失败判断。继续/子代理不算重试，排除项写excluded_candidates及依据。状态/路径不明先自主查证，仍不明记pending，不中途提问。
+3. 用deliveries读取全部成功组件结果，再合并正式答复最终路径形成formal_deliveries；核查全部必需成果及所有正式附件，列artifacts、哈希、来源引用。正式提供的research_plan等文件不得按名字剔除。`delivery_channel: formal_path`表示正式答复给出路径，无需下载组件。必须检查实际最终文件，不能因没按钮写failed。
 4. 结果表默认数据集根，结合题号/名称核实；指定序号写excel.object_slot，按[excel.md](excel.md)定位/扩展。`layout FILE --slot 3 --name MobileWork1009 --version 1009 --model DSV4`可只读生成计划，不让用户提供列字母或技术JSON。
 5. `execute PLAN.json`预检，`execute PLAN.json --apply`执行明确项。预检只输出独立审计目录，不改问题目录/原结果表，失败DOCX样本仅在审计目录。异常汇总，明确项继续；以实际copy/excel状态判断完成，不把planned当完成。
 
@@ -16,7 +16,7 @@
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "dataset_root": "/data/常规能力测试数据集",
   "batch_id": "workspace-20261014",
   "unattended": true,
@@ -45,10 +45,16 @@
         "submitted_at": "2026-10-15T08:00:00+08:00",
         "submission_evidence": "实际提交消息ID和时间，包含时区",
         "match_evidence": "正文与上传源素材匹配证据",
+        "client_presence": "visible", "presence_evidence": "指定工作空间当前有效任务列表包含该会话，未删除",
         "status": "success",
         "completed_at": "2026-10-15T08:05:00+08:00",
-        "duration": "5m0s", "duration_evidence": "客户端完成状态时长",
+        "duration": "5m0s", "duration_source": "client_total", "duration_evidence": "客户端覆盖整次运行的累计时长",
         "completeness": "complete", "validation_evidence": "实际打开，题目要求已齐全",
+        "delivery_search_complete": true,
+        "formal_deliveries": [{
+          "source": "/projects/mobilework-batch/project1/报告.docx", "session_id": "first-session",
+          "evidence": "全部成功交付组件与完整正式回答逐项核查，仅正式提供此文件"
+        }],
         "artifacts": [{
           "session_id": "first-session",
           "source": "/projects/mobilework-batch/project1/报告.docx",
@@ -63,6 +69,7 @@
         "submitted_at": "2026-10-15T08:10:00+08:00",
         "submission_evidence": "第二次实际提交记录",
         "match_evidence": "同题同素材",
+        "client_presence": "visible", "presence_evidence": "指定工作空间当前有效任务列表包含该会话，未删除",
         "status": "running", "status_at_cutoff": "running",
         "cutoff_state_evidence": "根会话在统一截止仍运行的消息/状态记录",
         "delivery_search_complete": true, "completeness": "none",
@@ -75,6 +82,33 @@
 ```
 
 此例采用第一次，Excel填“一次运行成功”，第二次超时仅审计，不生成失败交付。
+
+## 客户端有效性与正式清单
+
+client_presence取visible/deleted/not_visible/unknown，presence_evidence引用当前完整有效列表、删除字段或应用只读查询。deleted_at非空、或deleted/not_visible的候选先移到excluded_candidates，不计运行次数；仅有已删除记录时发现表注明本批没有有效运行，Excel不填失败、不清历史。unknown/缺证据不能成为确定成功，首次有效成功时额外未知运行仍不影响首次选择。只读查库和映射必须与客户端有效范围一致，不能以目录尚在替代。
+
+formal_deliveries是选中运行**未经文件名筛选的全部正式提供文件**，每项含source绝对路径、session_id、evidence。先运行 `deliveries workbuddy SESSION.jsonl --session ID` 或 `deliveries mobilework APP.db --session ID`，定时模式加 `--cutoff ISO`，再查完整正式答复补充路径。辅助命令只提取组件，不判断会话当前是否有效、文件内容是否齐全或正文中的路径。遇结构不符先核查原始schema，不能改为只取首条。多次相同路径保留全部来源；版本被覆盖须单列问题。artifacts还可包含已核实的项目必要依赖。
+
+schema 3成功行须delivery_search_complete true，且formal_deliveries中每一项都在artifacts中。存在差额不能宣称收齐；补齐证据/清单后再执行，不绕过检查。两次失败仍仅导出第二次正式界面DOCX，不额外收失败附件。
+
+## 完整用时来源
+
+schema 3已结束运行使用duration_source：client_total（优先，已有duration和覆盖整次的duration_evidence）、client_segments/execution_segments（全部有证据执行段）、elapsed_fallback（真实提交/开始至最终完成的经过时长）。不能把手算首末差标成client_total；界面单段值不能代表压缩前后的整次运行。旧计划未带来源时按原方式读取；新计划来源/范围不足仅留空用时、标用时无法确认，不影响已确认的文件收集与完成情况。
+
+分段示例（置于同一run中，须补齐submitted_at/completed_at）：
+
+```json
+{
+  "duration_source": "client_segments",
+  "duration_segments_complete": true,
+  "duration_segments": [
+    {"session_id": "first-session", "started_at": "2026-10-15T08:00:00+08:00", "completed_at": "2026-10-15T08:02:00+08:00", "evidence": "压缩前客户端显示段及起止消息"},
+    {"session_id": "first-session", "started_at": "2026-10-15T08:03:00+08:00", "completed_at": "2026-10-15T08:06:00+08:00", "evidence": "继续执行段；段间一分钟为已核实暂停"}
+  ]
+}
+```
+
+脚本累计为5m0s，说明写明分段口径，JSON保留全部段；同会话、时间范围、顺序与不重叠须可核查。压缩执行段确实发生时同样列入，合成Continue/摘要/重放不当作新实验或重复计时。client_total存在时不再叠加分段。elapsed_fallback需要duration_evidence及真实起止，可用pause_seconds+pause_evidence扣除已确认等待/暂停；值和说明明确写“经过时长”。超时仍按截止规则计算，不混用已完成任务的口径。
 
 ## 截止字段与状态
 

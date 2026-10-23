@@ -203,10 +203,18 @@ class ScheduledIntegrationTests(unittest.TestCase):
         self.assertIn("测试对象3", cells["H1"]["value"])
         self.assertEqual(cells["H2"]["value"], "2m3s")
         self.assertEqual(cells["I2"]["value"], "一次运行成功")
-        self.assertEqual(cells["H1"]["style"], cells["F1"]["style"])
         with zipfile.ZipFile(path) as z:
+            old_styles = ET.fromstring(original["xl/styles.xml"]).find(x.Q + "cellXfs")
+            new_styles = ET.fromstring(z.read("xl/styles.xml")).find(x.Q + "cellXfs")
+            # Original style definitions stay intact; written cells use centered
+            # copies with the same non-alignment properties.
+            for index, old in enumerate(old_styles):
+                self.assertEqual(ET.tostring(old), ET.tostring(new_styles[index]))
+            header = new_styles[int(cells["H1"]["style"])]
+            self.assertEqual(header.get("fontId"), old_styles[int(cells["F1"]["style"])].get("fontId"))
+            self.assertEqual(header.find(x.Q + "alignment").get("horizontal"), "center")
             for name in original:
-                if name != "xl/worksheets/sheet1.xml": self.assertEqual(z.read(name), original[name])
+                if name not in {"xl/worksheets/sheet1.xml", "xl/styles.xml"}: self.assertEqual(z.read(name), original[name])
             root = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
             cols = root.find(x.Q + "cols")
             widths = {int(node.get("min")): node.get("width") for node in cols}
